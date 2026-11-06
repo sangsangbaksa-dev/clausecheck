@@ -1,0 +1,11 @@
+{
+  "name": "clausecheck",
+  "version": "1.0.0",
+  "private": true,
+  "description": "계약서 위험조항 점검 (브라우저 내 정적 웹앱)",
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/logic.test.js",
+    "start": "python3 -m http.server 8141"
+  }
+}
