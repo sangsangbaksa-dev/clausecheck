@@ -2,7 +2,8 @@
 import {
   analyzeContract, redact, buildNegotiationEmail, buildMarkdownReport, buildFindingsCsv,
   makeReviewRecord, reviewToResult, parseBackup, makeBackupJson, mergeReviews,
-  CONTRACT_TYPES, SAMPLE_CONTRACT, CONSTANTS, typeLabel,
+  compareContracts, buildReportModel, itemKey, statusOf, setStatus, summarizeStatuses,
+  STATUSES, STATUS_UNSET, CONTRACT_TYPES, SAMPLE_CONTRACT, CONSTANTS, typeLabel, DISCLAIMER,
 } from './logic.js';
 import { buildAiPayload, parseAiReply, isPlausibleKey, localExplanation, extractReplyText } from './ai.js';
 
@@ -11,13 +12,23 @@ const SEV_RANK = { 높음: 0, 중간: 1, 참고: 2 };
 const API_URL = 'https://api.anthropic.com/v1/messages';
 const THEME_KEY = 'clausecheck-theme';
 const MAX_SAVED = 100;
+const TABS = ['check', 'compare', 'history'];
+// 비교 데모용 두 번째 버전: 샘플에서 해지 조항을 고치고, 지급 기한을 줄이고, 자동 갱신 조항을 더합니다.
+const SAMPLE_V2 = SAMPLE_CONTRACT
+  .replace('갑은 언제든지 본 계약을 해지할 수 있다.', '갑과 을은 서면 합의로만 본 계약을 해지할 수 있다.')
+  .replace('90일 이내에 지급할 수 있다.', '30일 이내에 지급할 수 있다.')
+  + '\n제11조 (자동 갱신)\n본 계약은 기간 만료 후 자동 갱신되며, 갱신된 계약을 해지하면 위약금을 부담한다.\n';
 
 const state = {
-  review: null,      // { id, title, type, text, result, createdAt }
-  anchors: new Map(), // finding id -> <mark> element
-  reviews: [],       // 저장 기록
-  negoRules: new Map(), // ruleId -> item (협상 이메일 항목)
-  aiChoices: new Map(), // finding id -> finding (AI 설명 후보)
+  review: null,          // { id, title, type, text, result, createdAt, statuses }
+  anchors: new Map(),    // finding id -> <mark> element
+  marks: [],             // 원문의 <mark> 목록 (수용 표시 갱신용)
+  findingById: new Map(),
+  itemMap: new Map(),    // itemKey -> 항목 (상태 선택 변경 시 찾기용)
+  reviews: [],           // 저장 기록
+  negoRules: new Map(),  // ruleId -> item (협상 이메일 항목)
+  aiChoices: new Map(),  // finding id -> finding (AI 설명 후보)
+  emailEdited: false,    // 초안을 사용자가 고쳤는지
 };
 
 // ───────────── 작은 도우미 ─────────────
@@ -44,12 +55,14 @@ function el(tag, attrs = {}, ...children) {
 
 const sevClass = (sev) => `sev-${sev}`;
 const badge = (sev) => el('span', { class: `sev-badge ${sevClass(sev)}`, text: sev });
+const flag = () => el('span', { class: 'flag-inline', text: '확인 필요', title: '법령·관행 기준을 참고한 임의 기준입니다 (기준일 2026년 11월)' });
 const reduceMotion = () => window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const STATUS_CLASS = { '협상 필요': 'st-negotiate', 확인함: 'st-checked', 수용: 'st-accepted', [STATUS_UNSET]: 'st-none' };
 
 function setMsg(id, text, isError = false) {
   const node = $(id);
   node.textContent = text;
-  node.style.color = isError ? 'var(--sev-high-ink)' : '';
+  node.classList.toggle('is-error', !!isError);
 }
 
 let toastTimer = null;
@@ -121,8 +134,12 @@ function aiMaskOptions() {
 function loadReviews() {
   const raw = safeGet(CONSTANTS.STORAGE_KEY);
   if (!raw) return [];
-  const parsed = parseBackup(JSON.stringify({ app: 'clausecheck', reviews: JSON.parse(raw) }));
-  return parsed.ok ? parsed.reviews : [];
+  try {
+    const parsed = parseBackup(JSON.stringify({ app: 'clausecheck', reviews: JSON.parse(raw) }));
+    return parsed.ok ? parsed.reviews : [];
+  } catch {
+    return [];
+  }
 }
 
 function persistReviews() {
@@ -133,11 +150,14 @@ function persistReviews() {
 
 // ───────────── 초기화 ─────────────
 function init() {
-  const typeSelect = $('contract-type');
-  for (const t of CONTRACT_TYPES) typeSelect.append(el('option', { value: t.key, text: t.label }));
-  typeSelect.value = 'freelance';
+  for (const id of ['contract-type', 'cmp-type']) {
+    const select = $(id);
+    for (const t of CONTRACT_TYPES) select.append(el('option', { value: t.key, text: t.label }));
+    select.value = 'freelance';
+  }
 
   applySavedTheme();
+  updateThemeButton();
   state.reviews = loadReviews();
   if (safeGet(CONSTANTS.AI_KEY_STORAGE)) {
     $('ai-forget').hidden = false;
@@ -161,11 +181,16 @@ function currentTheme() {
   return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 }
 
+function updateThemeButton() {
+  $('theme-toggle').textContent = currentTheme() === 'dark' ? '라이트 모드' : '다크 모드';
+}
+
 function bindEvents() {
   $('theme-toggle').addEventListener('click', () => {
     const next = currentTheme() === 'dark' ? 'light' : 'dark';
     document.documentElement.dataset.theme = next;
     safeSet(THEME_KEY, next);
+    updateThemeButton();
   });
 
   $('contract-text').addEventListener('input', updateCount);
@@ -186,16 +211,15 @@ function bindEvents() {
 
   $('input-form').addEventListener('submit', (e) => { e.preventDefault(); runCheck(); });
 
-  // 탭
-  const tabs = [$('tab-check'), $('tab-history')];
-  tabs.forEach((tab, i) => {
-    tab.addEventListener('click', () => showTab(i === 0 ? 'check' : 'history'));
+  // 탭 (화살표 키로 이동)
+  TABS.forEach((name, i) => {
+    const tab = $(`tab-${name}`);
+    tab.addEventListener('click', () => showTab(name));
     tab.addEventListener('keydown', (e) => {
-      if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
-        const next = tabs[(i + 1) % 2];
-        next.focus();
-        showTab(next === tabs[0] ? 'check' : 'history');
-      }
+      if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+      const next = TABS[(i + (e.key === 'ArrowRight' ? 1 : TABS.length - 1)) % TABS.length];
+      $(`tab-${next}`).focus();
+      showTab(next);
     });
   });
 
@@ -203,35 +227,55 @@ function bindEvents() {
   $('save-btn').addEventListener('click', saveCurrent);
   $('md-btn').addEventListener('click', () => {
     if (!state.review) return;
-    const md = buildMarkdownReport(reportInput());
-    download(`clausecheck-${todayStamp()}.md`, md, 'text/markdown;charset=utf-8');
+    download(`clausecheck-${todayStamp()}.md`, buildMarkdownReport(reportSource(), state.review.statuses), 'text/markdown;charset=utf-8');
   });
   $('csv-btn').addEventListener('click', () => {
     if (!state.review) return;
-    download(`clausecheck-${todayStamp()}.csv`, buildFindingsCsv(state.review.result), 'text/csv;charset=utf-8');
+    download(`clausecheck-${todayStamp()}.csv`, buildFindingsCsv(state.review.result, state.review.statuses), 'text/csv;charset=utf-8');
   });
   $('print-btn').addEventListener('click', () => {
     if (!state.review) return;
-    $('print-pre').textContent = buildMarkdownReport(reportInput());
+    renderPrintReport();
     window.print();
   });
+  window.addEventListener('afterprint', () => { $('print-area').textContent = ''; });
   $('mask-btn').addEventListener('click', showMaskPreview);
   $('copy-masked').addEventListener('click', async () => {
     const text = $('mask-preview').textContent;
     setMsg('mask-msg', (await copyText(text)) ? '가린 텍스트를 복사했습니다.' : '복사하지 못했습니다. 텍스트를 직접 선택해 복사하세요.');
   });
 
-  // 발견 목록 (사이드바)
+  // 발견 목록: 위치 이동 버튼과 상태 선택
   $('finding-list').addEventListener('click', (e) => {
     const btn = e.target.closest('button[data-fid]');
     if (btn) jumpTo(btn.dataset.fid);
   });
+  $('finding-list').addEventListener('change', onStatusChange);
+  $('checklist').addEventListener('change', onStatusChange);
 
-  // 체크리스트 / 협상 / AI 선택 변경
+  // 협상 이메일
   $('make-email').addEventListener('click', makeEmail);
+  $('email-out').addEventListener('input', () => { state.emailEdited = true; $('copy-email').disabled = !$('email-out').value; });
   $('copy-email').addEventListener('click', async () => {
     setMsg('email-msg', (await copyText($('email-out').value)) ? '초안을 복사했습니다.' : '복사하지 못했습니다. 텍스트를 직접 선택하세요.');
   });
+
+  // 버전 비교
+  $('cmp-run').addEventListener('click', runCompare);
+  $('cmp-sample').addEventListener('click', () => {
+    $('cmp-old').value = SAMPLE_CONTRACT;
+    $('cmp-new').value = SAMPLE_V2;
+    $('cmp-type').value = 'freelance';
+    setMsg('cmp-msg', '샘플 두 버전을 넣었습니다. 비교하기를 누르세요.');
+  });
+  $('cmp-use-current').addEventListener('click', () => {
+    const text = $('contract-text').value;
+    if (!text.trim()) { setMsg('cmp-msg', '새 점검 탭의 원문이 비어 있습니다.', true); return; }
+    $('cmp-new').value = text;
+    $('cmp-type').value = $('contract-type').value;
+    setMsg('cmp-msg', '새 점검 탭의 원문을 새 버전으로 넣었습니다. 이전 버전을 넣고 비교하세요.');
+  });
+
   $('ai-items').addEventListener('change', updateAiPreview);
   $('ai-run').addEventListener('click', runAi);
   $('ai-local').addEventListener('click', () => {
@@ -257,14 +301,13 @@ function bindEvents() {
 }
 
 function showTab(name) {
-  const isCheck = name === 'check';
-  $('tab-check').setAttribute('aria-selected', String(isCheck));
-  $('tab-history').setAttribute('aria-selected', String(!isCheck));
-  $('tab-check').tabIndex = isCheck ? 0 : -1;
-  $('tab-history').tabIndex = isCheck ? -1 : 0;
-  $('panel-check').hidden = !isCheck;
-  $('panel-history').hidden = isCheck;
-  if (!isCheck) renderHistory();
+  for (const t of TABS) {
+    const active = t === name;
+    $(`tab-${t}`).setAttribute('aria-selected', String(active));
+    $(`tab-${t}`).tabIndex = active ? 0 : -1;
+    $(`panel-${t}`).hidden = !active;
+  }
+  if (name === 'history') renderHistory();
 }
 
 function updateCount() {
@@ -273,6 +316,7 @@ function updateCount() {
   $('text-count').textContent = `${n.toLocaleString('ko-KR')}자 / 최대 ${CONSTANTS.MAX_INPUT_CHARS.toLocaleString('ko-KR')}자${over ? ' (앞부분만 분석)' : ''}`;
 }
 
+// .txt 파일을 읽어 원문 입력란에 넣습니다.
 async function onFileChosen(e) {
   const file = e.target.files && e.target.files[0];
   e.target.value = '';
@@ -310,7 +354,7 @@ function runCheck() {
   const type = $('contract-type').value;
   const title = $('review-title').value.trim().slice(0, 80) || defaultTitle(type);
   const result = analyzeContract(text, type);
-  state.review = { id: null, title, type, text, result, createdAt: new Date().toISOString() };
+  state.review = { id: null, title, type, text, result, createdAt: new Date().toISOString(), statuses: {} };
   setMsg('input-msg', '');
   renderResult();
   const box = $('result');
@@ -319,21 +363,20 @@ function runCheck() {
   $('result-title').focus({ preventScroll: true });
 }
 
-function reportInput() {
-  return { title: state.review.title, type: state.review.type, createdAt: state.review.createdAt, result: state.review.result };
+// 보고서 입력: 점검 결과와 제목·유형·날짜
+function reportSource() {
+  const rv = state.review;
+  return { title: rv.title, type: rv.type, createdAt: rv.createdAt, result: rv.result };
 }
 
 function renderResult() {
   const rv = state.review;
   const r = rv.result;
   $('result-title').textContent = rv.title;
-  const meta = [typeLabel(rv.type), formatDate(rv.createdAt), rv.id ? '저장됨' : '저장 전'].filter(Boolean).join(' · ');
-  $('result-meta').textContent = meta;
+  updateResultMeta();
 
   $('score-num').textContent = String(r.score);
   $('grade').textContent = r.grade;
-  $('save-btn').disabled = !!rv.id;
-  $('save-btn').textContent = rv.id ? '저장됨' : '이 기록 저장';
 
   const chips = $('chips');
   chips.textContent = '';
@@ -346,22 +389,48 @@ function renderResult() {
   trunc.hidden = !r.truncated;
   trunc.textContent = r.truncated ? `원문이 ${CONSTANTS.MAX_INPUT_CHARS.toLocaleString('ko-KR')}자를 넘어 앞부분만 분석했습니다.` : '';
 
+  state.itemMap = new Map();
+  for (const f of [...r.findings, ...r.absences]) state.itemMap.set(itemKey(f), f);
+
   renderFindingList(r);
   renderContract(r);
+  renderStatusSummary();
   renderChecklist(r);
   renderNegotiation(r);
   renderAiChoices(r);
   $('email-out').value = '';
   $('copy-email').disabled = true;
+  state.emailEdited = false;
   setMsg('email-msg', '');
   $('mask-block').hidden = true;
   setMsg('ai-msg', safeGet(CONSTANTS.AI_KEY_STORAGE) ? '이 브라우저에 저장된 API 키를 사용합니다.' : '');
   updateAiPreview();
 }
 
+function updateResultMeta() {
+  const rv = state.review;
+  const meta = [typeLabel(rv.type), formatDate(rv.createdAt), rv.id ? '저장됨' : '저장 전'].filter(Boolean).join(' · ');
+  $('result-meta').textContent = meta;
+  $('save-btn').disabled = !!rv.id;
+  $('save-btn').textContent = rv.id ? '저장됨' : '이 기록 저장';
+}
+
+function renderStatusSummary() {
+  const rv = state.review;
+  const s = summarizeStatuses(rv.result, rv.statuses);
+  const box = $('status-summary');
+  box.textContent = '';
+  for (const key of ['협상 필요', '확인함', '수용', STATUS_UNSET]) {
+    box.append(el('li', { class: `chip ${STATUS_CLASS[key]}`, text: `${key} ${s[key]}` }));
+  }
+  refreshMarks();
+}
+
+// 발견 목록: 위치 이동 버튼 + 상태 선택
 function renderFindingList(r) {
   const list = $('finding-list');
   list.textContent = '';
+  state.findingById = new Map(r.findings.map((f) => [f.id, f]));
   if (!r.findings.length) {
     list.append(el('li', { class: 'finding-empty', text: '위험 문구로 찾은 항목이 없습니다. 아래 누락 체크리스트도 확인하세요.' }));
     return;
@@ -371,10 +440,53 @@ function renderFindingList(r) {
     const btn = el('button', {
       type: 'button', class: 'finding-item', 'data-fid': f.id, disabled: !hasText,
     },
-      el('span', { class: 'fi-row' }, badge(f.severity), ' ', el('span', { class: 'fi-title', text: f.title })),
+      el('span', { class: 'fi-row' }, badge(f.severity), ' ', el('span', { class: 'fi-title', text: f.title }), f.legalRef ? flag() : null),
       el('span', { class: 'fi-where', text: `조항 ${f.clauseNo ?? '-'} 부근` }),
       el('span', { class: 'fi-matched', text: `“${f.matched}”` }));
-    list.append(el('li', {}, btn));
+    list.append(el('li', { class: 'finding-row' }, btn, statusSelect(f, `${f.title} 확인 상태`)));
+  }
+}
+
+function statusSelect(item, label) {
+  const current = statusOf(state.review && state.review.statuses, item);
+  const sel = el('select', { class: 'status-select', 'data-key': itemKey(item), 'aria-label': label });
+  for (const v of [STATUS_UNSET, ...STATUSES]) {
+    const opt = el('option', { value: v === STATUS_UNSET ? '' : v, text: v });
+    if (v === current) opt.selected = true;
+    sel.append(opt);
+  }
+  return sel;
+}
+
+function onStatusChange(e) {
+  const sel = e.target.closest('select.status-select');
+  if (!sel || !state.review) return;
+  const item = state.itemMap.get(sel.dataset.key);
+  if (!item) return;
+  setItemStatus(item, sel.value);
+}
+
+function setItemStatus(item, value) {
+  const rv = state.review;
+  rv.statuses = setStatus(rv.statuses, item, value);
+  if (rv.id) {
+    const rec = state.reviews.find((x) => x.id === rv.id);
+    if (rec) {
+      rec.statuses = { ...rv.statuses };
+      persistReviews();
+    }
+  }
+  renderStatusSummary();
+}
+
+// 수용으로 정한 위험 문구는 원문에서 흐리게 보입니다.
+function refreshMarks() {
+  const rv = state.review;
+  if (!rv) return;
+  for (const mark of state.marks) {
+    const items = (mark.dataset.findings || '').split(' ').map((id) => state.findingById.get(id)).filter(Boolean);
+    const accepted = items.length > 0 && items.every((f) => statusOf(rv.statuses, f) === '수용');
+    mark.classList.toggle('is-accepted', accepted);
   }
 }
 
@@ -382,6 +494,7 @@ function renderContract(r) {
   const view = $('contract-view');
   view.textContent = '';
   state.anchors = new Map();
+  state.marks = [];
   if (!r.clauses.length) {
     view.append(el('p', { class: 'fine', text: '원문을 저장하지 않아 조항 본문은 표시하지 않습니다. 발견 목록과 체크리스트를 확인하세요.' }));
     return;
@@ -413,6 +526,7 @@ function renderContract(r) {
         title: covering.map((f) => `${f.severity}: ${f.title}`).join(' / '),
         tabindex: -1,
       });
+      state.marks.push(mark);
       for (const f of covering) {
         if (rel(f.start) === a && !state.anchors.has(f.id)) state.anchors.set(f.id, mark);
       }
@@ -445,15 +559,17 @@ function renderChecklist(r) {
   const ul = $('checklist');
   ul.textContent = '';
   if (!r.absences.length) {
-    ul.append(el('li', {}, el('span', { class: 'ck-box', 'aria-hidden': 'true', text: '✓' }), el('span', { class: 'ck-title', text: '확인한 보호 조항 문구가 모두 있습니다.' })));
+    ul.append(el('li', { class: 'ck-done' }, el('span', { class: 'ck-box', 'aria-hidden': 'true', text: '✓' }), el('span', { class: 'ck-title', text: '확인한 보호 조항 문구가 모두 있습니다.' })));
     return;
   }
   for (const a of r.absences) {
     ul.append(el('li', {},
       el('span', { class: 'ck-box', 'aria-hidden': 'true', text: '□' }),
-      el('div', {}, el('span', { class: 'ck-title' }, badge(a.severity), ' ', a.title)),
-      el('p', { class: 'ck-why', text: a.why }),
-      el('p', { class: 'ck-why', text: `확인 질문: ${a.question}` })));
+      el('div', { class: 'ck-main' },
+        el('p', { class: 'ck-title' }, badge(a.severity), ' ', a.title, a.legalRef ? flag() : null),
+        el('p', { class: 'ck-why', text: a.why }),
+        el('p', { class: 'ck-why', text: `확인 질문: ${a.question}` })),
+      statusSelect(a, `${a.title} 확인 상태`)));
   }
 }
 
@@ -464,20 +580,23 @@ function uniqueRuleItems(r) {
   return seen;
 }
 
+// 협상 필요 또는 미확인 항목은 기본으로 고르고, 수용으로 정한 항목은 뺍니다.
 function renderNegotiation(r) {
   const box = $('nego-list');
   box.textContent = '';
   state.negoRules = uniqueRuleItems(r);
   for (const [ruleId, item] of state.negoRules) {
+    const st = statusOf(state.review.statuses, item);
     box.append(el('label', {},
-      el('input', { type: 'checkbox', value: ruleId, checked: true }),
-      el('span', {}, `[${item.severity}] ${item.title}`)));
+      el('input', { type: 'checkbox', value: ruleId, checked: st !== '수용' }),
+      el('span', {}, `[${item.severity}] ${item.title}${item.legalRef ? ' [확인 필요]' : ''} · ${st}`)));
   }
   if (!state.negoRules.size) box.append(el('p', { class: 'fine', text: '이메일에 넣을 항목이 없습니다.' }));
 }
 
 function makeEmail() {
   if (!state.review) return;
+  if (state.emailEdited && !window.confirm('고친 초안이 있습니다. 다시 만들면 고친 내용이 사라집니다. 계속할까요?')) return;
   const checked = new Set([...$('nego-list').querySelectorAll('input[type="checkbox"]:checked')].map((i) => i.value));
   const r = state.review.result;
   const findings = r.findings.filter((f) => checked.has(f.ruleId));
@@ -487,10 +606,14 @@ function makeEmail() {
     senderName: $('sender-name').value.trim() || '[본인 성함]',
     receiverName: $('receiver-name').value.trim() || '[상대방 성함]',
     contractTitle: state.review.title,
+    deadline: $('email-deadline').value.trim(),
+    extraNote: $('email-extra').value,
+    includeQuestions: $('email-questions').checked,
   });
   $('email-out').value = mail;
+  state.emailEdited = false;
   $('copy-email').disabled = false;
-  setMsg('email-msg', '초안을 만들었습니다. 내용을 확인한 뒤 보내세요.');
+  setMsg('email-msg', '초안을 만들었습니다. 내용을 확인하고 필요하면 고쳐 쓰세요.');
 }
 
 function showMaskPreview() {
@@ -507,18 +630,55 @@ function showMaskPreview() {
   setMsg('mask-msg', '');
 }
 
+// 인쇄용 보고서: 텍스트 노드로만 만들고, 인쇄가 끝나면 비웁니다.
+function renderPrintReport() {
+  const rv = state.review;
+  const m = buildReportModel(reportSource(), rv.statuses);
+  const area = $('print-area');
+  const item = (x) => el('div', { class: 'rp-item' },
+    el('h3', {}, `[${x.severity}] ${x.title}`, x.legalRef ? ' (확인 필요)' : ''),
+    el('p', { class: 'rp-meta', text: `${x.kind === 'absent' ? '누락 항목' : `조항 ${x.clauseNo ?? '-'} 부근 · 발견 문구 “${x.matched}”`} · 상태: ${x.status}` }),
+    el('p', { text: `위험 이유: ${x.why}` }),
+    el('p', { text: `확인 질문: ${x.question}` }),
+    el('p', { text: `협상 제안: ${x.negotiation}` }));
+  area.textContent = '';
+  area.append(el('article', { class: 'report' },
+    el('header', { class: 'rp-head' },
+      el('p', { class: 'rp-kicker', text: 'ClauseCheck · 계약서 위험조항 점검 보고서' }),
+      el('h1', { text: m.title }),
+      el('p', { class: 'rp-meta', text: `계약 유형: ${m.type} · 점검일: ${m.date} · 기준일: ${m.asOf}` })),
+    el('section', { class: 'rp-section' },
+      el('h2', { text: '요약' }),
+      el('p', { text: `위험 점수 ${m.score} / 100 (위험도 ${m.grade})` }),
+      el('p', { text: `발견: 높음 ${m.counts.높음} · 중간 ${m.counts.중간} · 참고 ${m.counts.참고} · 누락 ${m.counts.누락}` }),
+      el('p', { text: `확인 상태: 협상 필요 ${m.statusSummary['협상 필요']} · 확인함 ${m.statusSummary.확인함} · 수용 ${m.statusSummary.수용} · 미확인 ${m.statusSummary[STATUS_UNSET]}` }),
+      m.truncated ? el('p', { text: `원문이 ${CONSTANTS.MAX_INPUT_CHARS.toLocaleString('ko-KR')}자를 넘어 앞부분만 분석했습니다.` }) : null),
+    el('section', { class: 'rp-section' },
+      el('h2', { text: '위험 조항' }),
+      m.findings.length ? m.findings.map(item) : el('p', { text: '발견된 위험 문구가 없습니다.' })),
+    el('section', { class: 'rp-section' },
+      el('h2', { text: '누락된 보호 조항 체크리스트' }),
+      m.absences.length
+        ? el('ul', { class: 'rp-check' }, m.absences.map((a) => el('li', {}, `☐ [${a.severity}] ${a.title}${a.legalRef ? ' (확인 필요)' : ''} · 상태: ${a.status}`, el('br'), a.why)))
+        : el('p', { text: '확인한 보호 조항 문구가 모두 있습니다 (문구 기준).' })),
+    el('footer', { class: 'rp-foot' },
+      el('p', { text: DISCLAIMER }),
+      el('p', { text: m.legalNote }),
+      el('p', { text: `기준: ${m.asOf}. ${m.basis}` }))));
+}
+
 // ───────────── 저장 / 이력 ─────────────
 function saveCurrent() {
   if (!state.review || state.review.id) return;
   const rv = state.review;
   const rec = makeReviewRecord({
-    title: rv.title, type: rv.type, text: rv.text, keepText: $('keep-text').checked, result: rv.result,
+    title: rv.title, type: rv.type, text: rv.text, keepText: $('keep-text').checked, result: rv.result, statuses: rv.statuses,
   });
   const before = state.reviews;
   state.reviews = [rec, ...before].slice(0, MAX_SAVED);
   if (!persistReviews()) { state.reviews = before; return; }
   rv.id = rec.id;
-  renderResult();
+  updateResultMeta();
   toast('이 브라우저에 저장했습니다.');
 }
 
@@ -527,10 +687,15 @@ function renderHistory() {
   list.textContent = '';
   $('history-empty').hidden = state.reviews.length > 0;
   for (const rec of state.reviews) {
+    const need = Object.values(rec.statuses || {}).filter((v) => v === '협상 필요').length;
+    const meta = [
+      typeLabel(rec.type), formatDate(rec.createdAt), `점수 ${rec.score} (${rec.grade})`,
+      need ? `협상 필요 ${need}` : '', rec.text ? '' : '원문 미저장',
+    ].filter(Boolean).join(' · ');
     list.append(el('li', {},
       el('div', {},
         el('p', { class: 'hi-title', text: rec.title || '(제목 없음)' }),
-        el('p', { class: 'hi-meta', text: `${typeLabel(rec.type)} · ${formatDate(rec.createdAt)} · 점수 ${rec.score} (${rec.grade})${rec.text ? '' : ' · 원문 미저장'}` })),
+        el('p', { class: 'hi-meta', text: meta })),
       el('div', { class: 'hi-actions' },
         el('button', { type: 'button', class: 'btn ghost small', 'data-action': 'open', 'data-id': rec.id, text: '열기' }),
         el('button', { type: 'button', class: 'btn ghost small', 'data-action': 'delete', 'data-id': rec.id, text: '삭제' }))));
@@ -545,7 +710,7 @@ function onHistoryClick(e) {
   if (btn.dataset.action === 'open') {
     state.review = {
       id: rec.id, title: rec.title, type: rec.type, text: rec.text,
-      result: reviewToResult(rec), createdAt: rec.createdAt,
+      result: reviewToResult(rec), createdAt: rec.createdAt, statuses: { ...(rec.statuses || {}) },
     };
     $('contract-type').value = rec.type;
     $('review-title').value = rec.title;
@@ -561,7 +726,7 @@ function onHistoryClick(e) {
     persistReviews();
     if (state.review && state.review.id === rec.id) {
       state.review.id = null;
-      if ($('result').hidden === false) renderResult();
+      if ($('result').hidden === false) updateResultMeta();
     }
     renderHistory();
     setMsg('history-msg', '기록을 삭제했습니다.');
@@ -583,6 +748,59 @@ async function onImportChosen(e) {
   if (!persistReviews()) { state.reviews = before; return; }
   renderHistory();
   setMsg('history-msg', `${parsed.reviews.length}건을 확인해 합쳤습니다. 저장된 기록은 총 ${merged.length}건입니다.`);
+}
+
+// ───────────── 버전 비교 ─────────────
+function runCompare() {
+  const oldText = $('cmp-old').value;
+  const newText = $('cmp-new').value;
+  if (!oldText.trim() || !newText.trim()) {
+    setMsg('cmp-msg', '이전 버전과 새 버전을 모두 입력하세요.', true);
+    return;
+  }
+  const c = compareContracts(oldText, newText, $('cmp-type').value);
+  renderCompare(c);
+  setMsg('cmp-msg', '비교를 마쳤습니다. 결과는 저장되지 않습니다.');
+}
+
+function signed(n) { return n > 0 ? `+${n}` : String(n); }
+
+function renderCompare(c) {
+  const out = $('cmp-out');
+  out.textContent = '';
+  const metric = (label, value) => el('div', { class: 'metric' },
+    el('p', { class: 'metric-label', text: label }), el('p', { class: 'metric-value', text: value }));
+  out.append(el('div', { class: 'metric-grid' },
+    metric('점수 변화', `${c.before.score} → ${c.after.score} (${signed(c.scoreDelta)})`),
+    metric('새로 생긴 위험', `${c.added.length}개`),
+    metric('사라진 위험', `${c.removed.length}개`),
+    metric('새로 빠진 보호 조항', `${c.newlyMissing.length}개`),
+    metric('채워진 보호 조항', `${c.resolved.length}개`)));
+  if (c.capped) {
+    out.append(el('p', { class: 'notice-warn', text: `점수는 100점에서 멈춥니다. 상한 없이 더한 차이는 ${signed(c.rawDelta)}입니다.` }));
+  }
+  if (c.truncated) {
+    out.append(el('p', { class: 'notice-warn', text: `원문이 ${CONSTANTS.MAX_INPUT_CHARS.toLocaleString('ko-KR')}자를 넘어 앞부분만 비교했습니다.` }));
+  }
+
+  const row = (x, extra) => el('li', { class: 'cmp-row' },
+    el('div', {}, badge(x.severity), ' ', el('span', { class: 'fi-title', text: x.title }), x.legalRef ? flag() : null),
+    x.samples ? x.samples.map((s) => el('p', { class: 'fi-matched', text: `조항 ${s.clauseNo ?? '-'}: “${s.matched}”` })) : null,
+    extra ? el('p', { class: 'fine', text: extra }) : null);
+  const group = (title, rows, render) => el('section', { class: 'cmp-group' },
+    el('h4', { text: `${title} (${rows.length})` }),
+    rows.length ? el('ul', { class: 'cmp-list' }, rows.map(render)) : el('p', { class: 'fine', text: '해당 없음' }));
+
+  out.append(
+    group('새로 생긴 위험', c.added, (x) => row(x)),
+    group('사라진 위험', c.removed, (x) => row(x)),
+    group('발견 횟수가 바뀐 위험', c.changed, (x) => row(x, `${x.before}개 → ${x.after}개`)),
+    group('새로 빠진 보호 조항', c.newlyMissing, (x) => row(x, x.why)),
+    group('채워진 보호 조항', c.resolved, (x) => row(x, '이전 버전에 빠져 있던 보호 문구가 새 버전에 있습니다.')));
+  if (!c.added.length && !c.removed.length && !c.changed.length && !c.newlyMissing.length && !c.resolved.length) {
+    out.append(el('p', { class: 'fine', text: '규칙 기준으로 달라진 항목이 없습니다.' }));
+  }
+  out.append(el('p', { class: 'fine', text: '규칙 단위로 비교합니다. 문장 위치가 바뀌어도 같은 규칙이면 같은 항목으로 봅니다. 문구의 법적 차이는 판단하지 않습니다.' }));
 }
 
 // ───────────── AI 설명 패널 ─────────────
@@ -753,4 +971,3 @@ if (typeof document !== 'undefined') {
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 }
-
