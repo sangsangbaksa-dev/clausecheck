@@ -258,59 +258,234 @@ export function redact(text, options = {}) {
   return { text: out, counts };
 }
 
+// ───────────── 조항별 상태 (확인함·협상 필요·수용) ─────────────
+export const STATUSES = ['확인함', '협상 필요', '수용'];
+export const STATUS_UNSET = '미확인';
+
+/** 항목의 안정적인 키. 원문을 다시 분석해도 같은 항목이면 같은 키가 나옵니다. */
+export function itemKey(item) {
+  if (item.kind === 'absent') return `absent|${item.ruleId}`;
+  return `risk|${item.ruleId}|${item.clauseNo ?? ''}|${item.matched ?? ''}`;
+}
+
+export function statusOf(statuses, item) {
+  const v = statuses ? statuses[itemKey(item)] : undefined;
+  return STATUSES.includes(v) ? v : STATUS_UNSET;
+}
+
+/** 상태를 바꾼 새 객체를 돌려줍니다. value 가 목록에 없으면(미확인) 키를 지웁니다. */
+export function setStatus(statuses, item, value) {
+  const next = { ...(statuses || {}) };
+  const key = typeof item === 'string' ? item : itemKey(item);
+  if (STATUSES.includes(value)) next[key] = value;
+  else delete next[key];
+  return next;
+}
+
+/** 저장·백업에서 읽은 상태 객체를 검증합니다. 잘못된 값은 버립니다. */
+export function sanitizeStatuses(input) {
+  const out = {};
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return out;
+  let n = 0;
+  for (const [k, v] of Object.entries(input)) {
+    if (n >= 500) break;
+    if (k.length > 400 || !STATUSES.includes(v)) continue;
+    out[k] = v;
+    n++;
+  }
+  return out;
+}
+
+export function summarizeStatuses(result, statuses) {
+  const s = { [STATUS_UNSET]: 0 };
+  for (const st of STATUSES) s[st] = 0;
+  for (const item of [...result.findings, ...result.absences]) s[statusOf(statuses, item)]++;
+  return s;
+}
+
+// ───────────── 버전 비교 ─────────────
+const pickRule = (x) => ({
+  ruleId: x.ruleId, title: x.title, severity: x.severity, legalRef: !!x.legalRef,
+  why: x.why, question: x.question, negotiation: x.negotiation,
+});
+
+/**
+ * 두 버전의 원문을 규칙 단위로 비교합니다. 문구 위치가 바뀌어도 같은 규칙이면 같은 항목으로 봅니다.
+ * added: 새 버전에만 생긴 위험 규칙, removed: 이전 버전에만 있던 위험 규칙,
+ * changed: 두 버전 모두 있으나 발견 횟수가 달라진 규칙,
+ * newlyMissing: 새 버전에서 새로 빠진 보호 조항, resolved: 새 버전에서 채워진 보호 조항.
+ */
+export function compareContracts(oldText, newText, typeKey = 'other') {
+  const before = analyzeContract(oldText, typeKey);
+  const after = analyzeContract(newText, typeKey);
+
+  const byRule = (r) => {
+    const m = new Map();
+    for (const f of r.findings) {
+      const e = m.get(f.ruleId) || { count: 0, samples: [], rule: f };
+      e.count++;
+      if (e.samples.length < 3) e.samples.push({ clauseNo: f.clauseNo, matched: f.matched });
+      m.set(f.ruleId, e);
+    }
+    return m;
+  };
+  const row = (e) => ({ ...pickRule(e.rule), count: e.count, samples: e.samples });
+  const b = byRule(before);
+  const a = byRule(after);
+
+  const added = [];
+  const changed = [];
+  let unchanged = 0;
+  for (const [id, e] of a) {
+    const prev = b.get(id);
+    if (!prev) added.push(row(e));
+    else if (prev.count !== e.count) changed.push({ ...row(e), before: prev.count, after: e.count });
+    else unchanged++;
+  }
+  const removed = [];
+  for (const [id, e] of b) if (!a.has(id)) removed.push(row(e));
+
+  const absBefore = new Set(before.absences.map((x) => x.ruleId));
+  const absAfter = new Set(after.absences.map((x) => x.ruleId));
+  const newlyMissing = after.absences.filter((x) => !absBefore.has(x.ruleId)).map(pickRule);
+  const resolved = before.absences.filter((x) => !absAfter.has(x.ruleId)).map(pickRule);
+
+  const bySev = (x, y) => SEV_ORDER[x.severity] - SEV_ORDER[y.severity];
+  added.sort(bySev);
+  removed.sort(bySev);
+  changed.sort(bySev);
+  newlyMissing.sort(bySev);
+  resolved.sort(bySev);
+
+  const side = (r) => ({ score: r.score, grade: r.grade, counts: r.counts, truncated: r.truncated });
+  // 점수는 100점에서 멈추므로, 상한에 걸리면 상한 없는 합계 차이도 함께 돌려줍니다.
+  const rawWeight = (ids) => [...new Set(ids)].reduce((sum, id) => sum + (CONSTANTS.SCORE_WEIGHTS[ruleSeverity(id)] || 0), 0);
+  return {
+    before: side(before),
+    after: side(after),
+    scoreDelta: after.score - before.score,
+    rawDelta: rawWeight(after.ruleHits) - rawWeight(before.ruleHits),
+    capped: before.score >= CONSTANTS.SCORE_MAX || after.score >= CONSTANTS.SCORE_MAX,
+    added,
+    removed,
+    changed,
+    unchanged,
+    newlyMissing,
+    resolved,
+    truncated: before.truncated || after.truncated,
+  };
+}
+
 // ───────────── 출력물 ─────────────
 const SEV_ORDER = { 높음: 0, 중간: 1, 참고: 2 };
+const LEGAL_NOTE = '확인 필요 표시가 붙은 항목은 법령·관행 기준을 참고한 임의 기준입니다. 법령 판정이 아니며, 기준은 바뀔 수 있습니다.';
 
-/** 협상 이메일 초안 (로컬 템플릿). 발견한 위험 조항 중 규칙별 중복 없이 사용합니다. */
-export function buildNegotiationEmail({ result, senderName = '[본인 성함]', receiverName = '[상대방 성함]', contractTitle = '' }) {
+const cleanField = (v, max) => String(v ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, max);
+
+/** 협상 이메일 초안 (로컬 템플릿). 규칙별로 한 번만 넣고, 심각도 순으로 정렬합니다. */
+export function buildNegotiationEmail({
+  result,
+  senderName = '[본인 성함]',
+  receiverName = '[상대방 성함]',
+  contractTitle = '',
+  deadline = '',
+  extraNote = '',
+  includeQuestions = false,
+}) {
   const items = [];
   const seen = new Set();
-  const all = [...result.findings, ...result.absences];
-  all.sort((a, b) => SEV_ORDER[a.severity] - SEV_ORDER[b.severity]);
+  const all = [...result.findings, ...result.absences].sort((a, b) => SEV_ORDER[a.severity] - SEV_ORDER[b.severity]);
   for (const f of all) {
     if (seen.has(f.ruleId)) continue;
     seen.add(f.ruleId);
     items.push(f);
   }
+  const recv = cleanField(receiverName, 30) || '[상대방 성함]';
+  const sender = cleanField(senderName, 30) || '[본인 성함]';
+  const title = cleanField(contractTitle, 80);
+  const due = cleanField(deadline, 40);
+  const note = String(extraNote ?? '').trim().slice(0, 800);
+
   const lines = [];
-  lines.push(`${receiverName} 님, 안녕하세요.`);
+  lines.push(`${recv} 님, 안녕하세요.`);
   lines.push('');
-  lines.push(`${contractTitle ? `"${contractTitle}" ` : ''}계약서를 검토하는 과정에서 아래 조항에 대해 조정을 요청드립니다.`);
+  lines.push(`${title ? `"${title}" ` : ''}계약서를 검토하는 과정에서 아래 조항에 대해 조정을 요청드립니다.`);
   lines.push('');
   if (items.length === 0) {
     lines.push('(선택된 항목이 없습니다. 조정 요청 항목을 선택한 뒤 다시 만들어 주세요.)');
+    lines.push('');
   }
   items.forEach((f, i) => {
     const where = f.kind === 'risk' ? ` (조항 ${f.clauseNo} 부근)` : ' (누락된 조항)';
-    lines.push(`${i + 1}. ${f.title}${where}`);
-    lines.push(`   - 제안: ${f.negotiation}`);
+    const check = f.legalRef ? ' [확인 필요]' : '';
+    lines.push(`${i + 1}. ${f.title}${where}${check}`);
+    if (includeQuestions && f.question) lines.push(`   - 확인하고 싶은 점: ${f.question}`);
+    lines.push(`   - 요청: ${f.negotiation}`);
     lines.push('');
   });
+  if (note) {
+    lines.push('추가로 전달드릴 내용입니다.');
+    lines.push(note);
+    lines.push('');
+  }
+  if (due) {
+    lines.push(`회신 희망일: ${due}`);
+    lines.push('');
+  }
   lines.push('위 내용을 반영한 수정안을 검토할 수 있도록 공유해 주시면 감사하겠습니다.');
   lines.push('');
   lines.push('감사합니다.');
-  lines.push(senderName);
+  lines.push(sender);
   return lines.join('\n');
 }
 
-/** 점검 결과를 Markdown 으로 만듭니다. 원문 전체는 넣지 않습니다. */
-export function buildMarkdownReport(review) {
+/** 보고서에 쓸 구조화된 데이터. 화면 인쇄용 보고서와 Markdown 이 같은 값을 씁니다. */
+export function buildReportModel(review, statuses = {}) {
   const r = review.result;
+  const pick = (x) => ({
+    title: x.title, severity: x.severity, clauseNo: x.clauseNo ?? null, matched: x.matched ?? '',
+    why: x.why, question: x.question, negotiation: x.negotiation,
+    legalRef: !!x.legalRef, kind: x.kind, status: statusOf(statuses, x),
+  });
+  return {
+    title: review.title || '(제목 없음)',
+    type: typeLabel(review.type),
+    date: review.createdAt ? review.createdAt.slice(0, 10) : '',
+    score: r.score,
+    grade: r.grade,
+    counts: r.counts,
+    statusSummary: summarizeStatuses(r, statuses),
+    findings: r.findings.map(pick),
+    absences: r.absences.map(pick),
+    truncated: !!r.truncated,
+    asOf: CONSTANTS.기준일,
+    basis: CONSTANTS.적용_안내,
+    disclaimer: DISCLAIMER,
+    legalNote: LEGAL_NOTE,
+  };
+}
+
+/** 점검 결과를 Markdown 으로 만듭니다. 원문 전체는 넣지 않습니다. */
+export function buildMarkdownReport(review, statuses = {}) {
+  const m = buildReportModel(review, statuses);
   const out = [];
-  out.push(`# 계약서 위험조항 점검 결과`);
+  out.push('# 계약서 위험조항 점검 결과');
   out.push('');
-  out.push(`- 제목: ${review.title || '(제목 없음)'}`);
-  out.push(`- 계약 유형: ${typeLabel(review.type)}`);
-  out.push(`- 점검일: ${review.createdAt ? review.createdAt.slice(0, 10) : ''}`);
-  out.push(`- 위험 점수: ${r.score} / 100 (${r.grade})`);
-  out.push(`- 발견: 높음 ${r.counts.높음}, 중간 ${r.counts.중간}, 참고 ${r.counts.참고}, 누락 ${r.counts.누락}`);
+  out.push(`- 제목: ${m.title}`);
+  out.push(`- 계약 유형: ${m.type}`);
+  out.push(`- 점검일: ${m.date}`);
+  out.push(`- 위험 점수: ${m.score} / 100 (${m.grade})`);
+  out.push(`- 발견: 높음 ${m.counts.높음}, 중간 ${m.counts.중간}, 참고 ${m.counts.참고}, 누락 ${m.counts.누락}`);
+  out.push(`- 확인 상태: 협상 필요 ${m.statusSummary['협상 필요']}, 확인함 ${m.statusSummary.확인함}, 수용 ${m.statusSummary.수용}, 미확인 ${m.statusSummary[STATUS_UNSET]}`);
   out.push('');
   out.push(`> ${DISCLAIMER}`);
+  out.push(`> ${LEGAL_NOTE}`);
   out.push('');
   out.push('## 위험 조항');
-  if (r.findings.length === 0) out.push('- 발견된 위험 문구가 없습니다.');
-  for (const f of r.findings) {
-    out.push(`### [${f.severity}] ${f.title} (조항 ${f.clauseNo} 부근)`);
+  if (m.findings.length === 0) out.push('- 발견된 위험 문구가 없습니다.');
+  for (const f of m.findings) {
+    out.push(`### [${f.severity}] ${f.title}${f.legalRef ? ' (확인 필요)' : ''} (조항 ${f.clauseNo} 부근)`);
+    out.push(`- 상태: ${f.status}`);
     out.push(`- 발견 문구: "${f.matched}"`);
     out.push(`- 위험 이유: ${f.why}`);
     out.push(`- 확인 질문: ${f.question}`);
@@ -318,13 +493,13 @@ export function buildMarkdownReport(review) {
     out.push('');
   }
   out.push('## 누락된 보호 조항 체크리스트');
-  if (r.absences.length === 0) out.push('- 확인한 보호 조항이 모두 있습니다 (문구 기준).');
-  for (const a of r.absences) {
-    out.push(`- [ ] [${a.severity}] ${a.title}: ${a.why}`);
+  if (m.absences.length === 0) out.push('- 확인한 보호 조항이 모두 있습니다 (문구 기준).');
+  for (const a of m.absences) {
+    out.push(`- [ ] [${a.severity}] ${a.title}${a.legalRef ? ' (확인 필요)' : ''}: ${a.why} (상태: ${a.status})`);
   }
   out.push('');
   out.push('---');
-  out.push(`기준: ${CONSTANTS.기준일}. ${CONSTANTS.적용_안내}`);
+  out.push(`기준: ${m.asOf}. ${CONSTANTS.적용_안내}`);
   return out.join('\n');
 }
 
@@ -335,14 +510,14 @@ export function csvCell(v) {
   return `"${s.replace(/"/g, '""')}"`;
 }
 
-export function buildFindingsCsv(result) {
-  const head = ['구분', '심각도', '항목', '조항번호', '발견 문구', '확인 질문', '협상 제안'];
+export function buildFindingsCsv(result, statuses = {}) {
+  const head = ['구분', '심각도', '항목', '확인 필요', '상태', '조항번호', '발견 문구', '확인 질문', '협상 제안'];
   const rows = [head.map(csvCell).join(',')];
   for (const f of result.findings) {
-    rows.push([ '위험 문구', f.severity, f.title, f.clauseNo, f.matched, f.question, f.negotiation ].map(csvCell).join(','));
+    rows.push(['위험 문구', f.severity, f.title, f.legalRef ? '예' : '', statusOf(statuses, f), f.clauseNo, f.matched, f.question, f.negotiation].map(csvCell).join(','));
   }
   for (const a of result.absences) {
-    rows.push([ '누락', a.severity, a.title, '', '', a.question, a.negotiation ].map(csvCell).join(','));
+    rows.push(['누락', a.severity, a.title, a.legalRef ? '예' : '', statusOf(statuses, a), '', '', a.question, a.negotiation].map(csvCell).join(','));
   }
   return '﻿' + rows.join('\r\n');
 }
@@ -351,16 +526,18 @@ export function buildFindingsCsv(result) {
 const slimFinding = (f) => ({
   id: String(f.id || ''), ruleId: f.ruleId, title: f.title, severity: f.severity, clauseNo: f.clauseNo ?? null,
   matched: f.matched ?? '', why: f.why, negotiation: f.negotiation, question: f.question, kind: f.kind || 'risk',
+  legalRef: !!f.legalRef,
 });
 const slimAbsence = (a) => ({
-  ruleId: a.ruleId, title: a.title, severity: a.severity, why: a.why, negotiation: a.negotiation, question: a.question, kind: 'absent',
+  ruleId: a.ruleId, title: a.title, severity: a.severity, why: a.why, negotiation: a.negotiation, question: a.question,
+  kind: 'absent', legalRef: !!a.legalRef,
 });
 
 /**
  * 저장 기록. 원문을 저장하도록 켠 경우 text 가 들어가고, 열 때 다시 분석합니다.
- * 원문을 끄면 발견 목록과 누락 목록(요약)만 남깁니다.
+ * 원문을 끄면 발견 목록과 누락 목록(요약)만 남깁니다. statuses 는 항목별 확인 상태입니다.
  */
-export function makeReviewRecord({ title, type, text, keepText, result, now = new Date() }) {
+export function makeReviewRecord({ title, type, text, keepText, result, statuses = {}, now = new Date() }) {
   return {
     id: `r${now.getTime().toString(36)}${Math.random().toString(36).slice(2, 7)}`,
     title: String(title || '').slice(0, 80),
@@ -372,6 +549,7 @@ export function makeReviewRecord({ title, type, text, keepText, result, now = ne
     counts: result.counts,
     findings: result.findings.map(slimFinding),
     absences: result.absences.map(slimAbsence),
+    statuses: sanitizeStatuses(statuses),
   };
 }
 
@@ -411,6 +589,7 @@ export function parseBackup(jsonText) {
     counts: r.counts && typeof r.counts === 'object' ? r.counts : { 높음: 0, 중간: 0, 참고: 0, 누락: 0 },
     findings: r.findings.filter((f) => f && typeof f.title === 'string').map(slimFinding),
     absences: r.absences.filter((a) => a && typeof a.title === 'string').map(slimAbsence),
+    statuses: sanitizeStatuses(r.statuses),
   }));
   return { ok: true, error: '', reviews };
 }

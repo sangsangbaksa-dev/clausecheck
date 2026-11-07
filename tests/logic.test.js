@@ -5,6 +5,8 @@ import {
   analyzeContract, splitClauses, redact, buildNegotiationEmail, buildMarkdownReport,
   buildFindingsCsv, makeReviewRecord, parseBackup, makeBackupJson, mergeReviews,
   computeScore, gradeOf, SAMPLE_CONTRACT, CONSTANTS, CONTRACT_TYPES, escapeRegExp, reviewToResult,
+  STATUSES, STATUS_UNSET, itemKey, statusOf, setStatus, sanitizeStatuses, summarizeStatuses,
+  compareContracts, buildReportModel, DISCLAIMER,
 } from '../logic.js';
 import { buildAiPayload, parseAiReply, isPlausibleKey, localExplanation, extractReplyText } from '../ai.js';
 
@@ -574,5 +576,194 @@ describe('ai helpers (no network)', () => {
     const t = extractReplyText({ content: [{ type: 'text', text: 'a' }, { type: 'tool_use' }, { type: 'text', text: 'b' }] });
     assert.equal(t, 'a\nb');
     assert.equal(extractReplyText(null), '');
+  });
+});
+
+describe('per-clause status', () => {
+  const result = analyzeContract(SAMPLE_CONTRACT, 'freelance');
+  const risk = result.findings[0];
+  const absent = result.absences[0];
+
+  test('keys are stable across re-analysis of the same text', () => {
+    const again = analyzeContract(SAMPLE_CONTRACT, 'freelance');
+    assert.equal(itemKey(again.findings[0]), itemKey(risk));
+    assert.equal(itemKey(absent), itemKey(absent));
+    assert.notEqual(itemKey(risk), itemKey(absent));
+  });
+
+  test('setStatus is immutable and unset value removes the key', () => {
+    const base = {};
+    const one = setStatus(base, risk, '협상 필요');
+    assert.equal(statusOf(one, risk), '협상 필요');
+    assert.equal(statusOf(base, risk), STATUS_UNSET);
+    const cleared = setStatus(one, risk, '');
+    assert.equal(statusOf(cleared, risk), STATUS_UNSET);
+    assert.deepEqual(cleared, {});
+  });
+
+  test('only the three allowed statuses are accepted', () => {
+    assert.equal(statusOf(setStatus({}, risk, 'hacked'), risk), STATUS_UNSET);
+    assert.deepEqual(STATUSES, ['확인함', '협상 필요', '수용']);
+  });
+
+  test('sanitize drops invalid values and caps the count', () => {
+    const many = {};
+    for (let i = 0; i < 700; i++) many[`k${i}`] = '확인함';
+    many.bad = 'nope';
+    many.num = 3;
+    const clean = sanitizeStatuses({ ...many });
+    assert.ok(Object.keys(clean).length <= 500);
+    assert.ok(!('bad' in clean) && !('num' in clean));
+    assert.deepEqual(sanitizeStatuses(['x']), {});
+    assert.deepEqual(sanitizeStatuses(null), {});
+  });
+
+  test('summary counts every finding and absence exactly once', () => {
+    let st = setStatus({}, risk, '수용');
+    st = setStatus(st, absent, '확인함');
+    const s = summarizeStatuses(result, st);
+    assert.equal(s.수용, 1);
+    assert.equal(s.확인함, 1);
+    const total = result.findings.length + result.absences.length;
+    assert.equal(s.수용 + s.확인함 + s[STATUS_UNSET] + s['협상 필요'], total);
+  });
+
+  test('statuses survive a saved record and a backup round-trip', () => {
+    const st = setStatus({}, risk, '협상 필요');
+    const rec = makeReviewRecord({ title: 'x', type: 'freelance', text: '', keepText: false, result, statuses: st });
+    assert.equal(statusOf(rec.statuses, rec.findings[0]), '협상 필요');
+    const parsed = parseBackup(makeBackupJson([rec]));
+    assert.equal(parsed.reviews[0].statuses[itemKey(rec.findings[0])], '협상 필요');
+    const bad = parseBackup(JSON.stringify({ app: 'clausecheck', reviews: [{ ...rec, statuses: { x: 'bogus' } }] }));
+    assert.deepEqual(bad.reviews[0].statuses, {});
+  });
+
+  test('records written before statuses existed still load', () => {
+    const old = makeReviewRecord({ title: 'x', type: 'freelance', text: '', keepText: false, result });
+    delete old.statuses;
+    const parsed = parseBackup(JSON.stringify({ app: 'clausecheck', reviews: [old] }));
+    assert.equal(parsed.ok, true);
+    assert.deepEqual(parsed.reviews[0].statuses, {});
+  });
+
+  test('legalRef is kept in saved records', () => {
+    const rec = makeReviewRecord({ title: 'x', type: 'freelance', text: '', keepText: false, result });
+    const flagged = result.findings.find((f) => f.ruleId === 'payment-over-60') || result.absences.find((a) => a.legalRef);
+    if (flagged) assert.equal(rec.findings.concat(rec.absences).find((x) => x.ruleId === flagged.ruleId).legalRef, true);
+  });
+});
+
+describe('version comparison', () => {
+  const base = '제1조 (목적)\n갑은 을에게 업무를 맡긴다.';
+  const addTerm = '\n\n제2조 (해지)\n갑은 언제든지 본 계약을 해지할 수 있다.';
+
+  test('identical texts show no added or removed risk and no score change', () => {
+    const c = compareContracts(SAMPLE_CONTRACT, SAMPLE_CONTRACT, 'freelance');
+    assert.equal(c.scoreDelta, 0);
+    assert.deepEqual(c.added, []);
+    assert.deepEqual(c.removed, []);
+    assert.deepEqual(c.changed, []);
+    assert.deepEqual(c.newlyMissing, []);
+    assert.deepEqual(c.resolved, []);
+  });
+
+  test('a clause added in the new version is reported as added risk and resolves a missing protection', () => {
+    const c = compareContracts(base, base + addTerm, 'other');
+    assert.ok(c.added.some((x) => x.ruleId === 'unilateral-termination'));
+    assert.ok(c.rawDelta > 0);
+    assert.ok(c.resolved.some((x) => x.ruleId === 'absent-termination'));
+    const hit = c.added.find((x) => x.ruleId === 'unilateral-termination');
+    assert.equal(hit.count, 1);
+    assert.match(hit.samples[0].matched, /언제든지/);
+  });
+
+  test('removing a risky clause reports it as removed and a newly missing protection', () => {
+    const c = compareContracts(base + addTerm, base, 'other');
+    assert.ok(c.removed.some((x) => x.ruleId === 'unilateral-termination'));
+    assert.ok(c.newlyMissing.some((x) => x.ruleId === 'absent-termination'));
+    assert.ok(c.rawDelta < 0);
+  });
+
+  test('a rule whose hit count changes is reported as changed, not added', () => {
+    const one = base + addTerm;
+    const two = one + '\n\n제3조 (추가)\n갑은 언제든지 계약을 해지할 수 있다.';
+    const c = compareContracts(one, two, 'other');
+    assert.deepEqual(c.added.map((x) => x.ruleId).filter((id) => id === 'unilateral-termination'), []);
+    const ch = c.changed.find((x) => x.ruleId === 'unilateral-termination');
+    assert.ok(ch);
+    assert.equal(ch.before, 1);
+    assert.equal(ch.after, 2);
+  });
+
+  test('empty inputs compare without throwing', () => {
+    const c = compareContracts('', '', 'other');
+    assert.equal(c.scoreDelta, 0);
+    assert.equal(c.truncated, false);
+  });
+});
+
+describe('negotiation email options', () => {
+  const result = analyzeContract(SAMPLE_CONTRACT, 'freelance');
+
+  test('deadline, extra note and sender/receiver names are placed in the draft', () => {
+    const mail = buildNegotiationEmail({
+      result, receiverName: '김OO', senderName: '이OO', contractTitle: '홈페이지 용역',
+      deadline: '2026년 11월 20일', extraNote: '첫 제안이므로 전화 협의도 환영합니다.',
+    });
+    assert.match(mail, /^김OO 님/);
+    assert.match(mail, /회신 희망일: 2026년 11월 20일/);
+    assert.match(mail, /전화 협의도 환영합니다/);
+    assert.ok(mail.trimEnd().endsWith('이OO'));
+  });
+
+  test('questions are included only when asked for, and item count is unchanged', () => {
+    const plain = buildNegotiationEmail({ result });
+    const withQ = buildNegotiationEmail({ result, includeQuestions: true });
+    assert.ok(!plain.includes('확인하고 싶은 점'));
+    assert.ok(withQ.includes('확인하고 싶은 점'));
+    const count = (m) => m.split('\n').filter((l) => /^\d+\. /.test(l)).length;
+    assert.equal(count(plain), count(withQ));
+  });
+
+  test('legal-reference items are marked 확인 필요 in the draft', () => {
+    const mail = buildNegotiationEmail({ result: analyzeContract('대금은 발행일로부터 90일 이내에 지급한다.', 'freelance') });
+    assert.match(mail, /\[확인 필요\]/);
+  });
+
+  test('extra input is trimmed and newlines in names are flattened', () => {
+    const mail = buildNegotiationEmail({ result, receiverName: '홍\n길동', extraNote: 'x'.repeat(2000) });
+    assert.match(mail, /^홍 길동 님/);
+    assert.ok(mail.length < 3000);
+  });
+});
+
+describe('printable report model and markdown', () => {
+  const result = analyzeContract(SAMPLE_CONTRACT, 'freelance');
+  const review = { title: '테스트', type: 'freelance', createdAt: '2026-11-07T01:02:03.000Z', result };
+
+  test('model carries disclaimer, as-of note, score and statuses', () => {
+    const st = setStatus({}, result.findings[0], '수용');
+    const m = buildReportModel(review, st);
+    assert.equal(m.disclaimer, DISCLAIMER);
+    assert.match(m.asOf, /2026년 11월/);
+    assert.match(m.legalNote, /확인 필요/);
+    assert.equal(m.date, '2026-11-07');
+    assert.equal(m.findings[0].status, '수용');
+    assert.equal(m.statusSummary.수용, 1);
+    assert.equal(m.findings.length, result.findings.length);
+  });
+
+  test('markdown shows status and 확인 필요 labels', () => {
+    const st = setStatus({}, result.findings[0], '협상 필요');
+    const md = buildMarkdownReport(review, st);
+    assert.match(md, /- 상태: 협상 필요/);
+    assert.match(md, /확인 필요/);
+    assert.match(md, /확인 상태: 협상 필요 1/);
+  });
+
+  test('csv includes status and 확인 필요 columns', () => {
+    const csv = buildFindingsCsv(result, setStatus({}, result.findings[0], '확인함'));
+    assert.match(csv.split('\r\n')[0], /상태/);
+    assert.match(csv, /"확인함"/);
   });
 });
