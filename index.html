@@ -12,9 +12,6 @@
   <meta property="og:title" content="ClauseCheck · 계약서 위험조항 점검">
   <meta property="og:description" content="계약서는 브라우저를 떠나지 않습니다. 위험 문장, 빠진 보호 조항, 버전 차이를 원문 위치와 함께.">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23BE123C'/%3E%3Cpath d='M9 10h14M9 16h10M9 22h12' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@600;700&display=swap">
   <link rel="stylesheet" href="styles.css">
   <script type="module" src="app.js"></script>
 </head>
@@ -289,6 +286,7 @@
             <div class="result-grid">
               <aside class="finding-panel" aria-labelledby="finding-title">
                 <h4 id="finding-title">발견 목록 (심각도순)</h4>
+                <div id="finding-filters" class="filter-row" role="group" aria-label="확인 상태별 보기"></div>
                 <ul id="finding-list" class="finding-list"></ul>
               </aside>
               <div class="contract-panel">

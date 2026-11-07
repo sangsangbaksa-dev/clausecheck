@@ -303,6 +303,16 @@ export function summarizeStatuses(result, statuses) {
   return s;
 }
 
+/** 발견 목록에서 고를 수 있는 보기 필터. '전체'는 필터를 걸지 않습니다. */
+export const STATUS_FILTERS = ['전체', STATUS_UNSET, ...STATUSES];
+
+/** 확인 상태로 항목을 거릅니다. 모르는 필터 값은 '전체'로 취급합니다. 원래 순서를 유지합니다. */
+export function filterByStatus(items, statuses, filter = '전체') {
+  if (!Array.isArray(items)) return [];
+  if (!STATUS_FILTERS.includes(filter) || filter === '전체') return items.slice();
+  return items.filter((item) => statusOf(statuses, item) === filter);
+}
+
 // ───────────── 버전 비교 ─────────────
 const pickRule = (x) => ({
   ruleId: x.ruleId, title: x.title, severity: x.severity, legalRef: !!x.legalRef,

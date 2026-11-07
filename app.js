@@ -3,7 +3,7 @@ import {
   analyzeContract, redact, buildNegotiationEmail, buildMarkdownReport, buildFindingsCsv,
   makeReviewRecord, reviewToResult, parseBackup, makeBackupJson, mergeReviews,
   compareContracts, buildReportModel, itemKey, statusOf, setStatus, summarizeStatuses,
-  STATUSES, STATUS_UNSET, CONTRACT_TYPES, SAMPLE_CONTRACT, CONSTANTS, typeLabel, DISCLAIMER,
+  STATUSES, STATUS_UNSET, STATUS_FILTERS, filterByStatus, CONTRACT_TYPES, SAMPLE_CONTRACT, CONSTANTS, typeLabel, DISCLAIMER,
 } from './logic.js';
 import { buildAiPayload, parseAiReply, isPlausibleKey, localExplanation, extractReplyText } from './ai.js';
 
@@ -28,6 +28,7 @@ const state = {
   reviews: [],           // 저장 기록
   negoRules: new Map(),  // ruleId -> item (협상 이메일 항목)
   aiChoices: new Map(),  // finding id -> finding (AI 설명 후보)
+  findingFilter: '전체', // 발견 목록의 확인 상태 필터
   emailEdited: false,    // 초안을 사용자가 고쳤는지
 };
 
@@ -251,6 +252,12 @@ function bindEvents() {
     if (btn) jumpTo(btn.dataset.fid);
   });
   $('finding-list').addEventListener('change', onStatusChange);
+  $('finding-filters').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-filter]');
+    if (!btn || !state.review) return;
+    state.findingFilter = btn.dataset.filter;
+    renderFindingList(state.review.result);
+  });
   $('checklist').addEventListener('change', onStatusChange);
 
   // 협상 이메일
@@ -372,6 +379,7 @@ function reportSource() {
 function renderResult() {
   const rv = state.review;
   const r = rv.result;
+  state.findingFilter = '전체';
   $('result-title').textContent = rv.title;
   updateResultMeta();
 
@@ -431,11 +439,17 @@ function renderFindingList(r) {
   const list = $('finding-list');
   list.textContent = '';
   state.findingById = new Map(r.findings.map((f) => [f.id, f]));
+  renderFindingFilters(r);
   if (!r.findings.length) {
     list.append(el('li', { class: 'finding-empty', text: '위험 문구로 찾은 항목이 없습니다. 아래 누락 체크리스트도 확인하세요.' }));
     return;
   }
-  for (const f of r.findings) {
+  const shown = filterByStatus(r.findings, state.review && state.review.statuses, state.findingFilter);
+  if (!shown.length) {
+    list.append(el('li', { class: 'finding-empty', text: '이 상태로 표시한 위험 문구가 없습니다.' }));
+    return;
+  }
+  for (const f of shown) {
     const hasText = r.clauses.length > 0;
     const btn = el('button', {
       type: 'button', class: 'finding-item', 'data-fid': f.id, disabled: !hasText,
@@ -444,6 +458,20 @@ function renderFindingList(r) {
       el('span', { class: 'fi-where', text: `조항 ${f.clauseNo ?? '-'} 부근` }),
       el('span', { class: 'fi-matched', text: `“${f.matched}”` }));
     list.append(el('li', { class: 'finding-row' }, btn, statusSelect(f, `${f.title} 확인 상태`)));
+  }
+}
+
+// 상태별 보기 버튼. 각 버튼에 해당 항목 수를 함께 씁니다.
+function renderFindingFilters(r) {
+  const group = $('finding-filters');
+  group.textContent = '';
+  const statuses = state.review && state.review.statuses;
+  for (const f of STATUS_FILTERS) {
+    const count = filterByStatus(r.findings, statuses, f).length;
+    const pressed = f === state.findingFilter;
+    group.append(el('button', {
+      type: 'button', class: 'filter-chip', 'data-filter': f, 'aria-pressed': pressed ? 'true' : 'false',
+    }, f === '전체' ? '전체' : f === STATUS_UNSET ? '미확인' : f, ` ${count}`));
   }
 }
 
@@ -469,6 +497,7 @@ function onStatusChange(e) {
 function setItemStatus(item, value) {
   const rv = state.review;
   rv.statuses = setStatus(rv.statuses, item, value);
+  if (state.findingFilter !== '전체') renderFindingList(rv.result);
   if (rv.id) {
     const rec = state.reviews.find((x) => x.id === rv.id);
     if (rec) {

@@ -6,7 +6,7 @@ import {
   buildFindingsCsv, makeReviewRecord, parseBackup, makeBackupJson, mergeReviews,
   computeScore, gradeOf, SAMPLE_CONTRACT, CONSTANTS, CONTRACT_TYPES, escapeRegExp, reviewToResult,
   STATUSES, STATUS_UNSET, itemKey, statusOf, setStatus, sanitizeStatuses, summarizeStatuses,
-  compareContracts, buildReportModel, DISCLAIMER,
+  compareContracts, buildReportModel, DISCLAIMER, filterByStatus, STATUS_FILTERS,
 } from '../logic.js';
 import { buildAiPayload, parseAiReply, isPlausibleKey, localExplanation, extractReplyText } from '../ai.js';
 
@@ -626,6 +626,29 @@ describe('per-clause status', () => {
     assert.equal(s.확인함, 1);
     const total = result.findings.length + result.absences.length;
     assert.equal(s.수용 + s.확인함 + s[STATUS_UNSET] + s['협상 필요'], total);
+  });
+
+  test('status filter keeps only items in the chosen state', () => {
+    const items = result.findings;
+    const st = setStatus({}, items[0], '협상 필요');
+    assert.deepEqual(STATUS_FILTERS, ['전체', STATUS_UNSET, '확인함', '협상 필요', '수용']);
+    assert.equal(filterByStatus(items, st, '전체').length, items.length);
+    const neg = filterByStatus(items, st, '협상 필요');
+    assert.equal(neg.length, 1);
+    assert.equal(itemKey(neg[0]), itemKey(items[0]));
+    assert.equal(filterByStatus(items, st, STATUS_UNSET).length, items.length - 1);
+    assert.equal(filterByStatus(items, st, '수용').length, 0);
+  });
+
+  test('status filter treats unknown values as 전체 and never mutates input', () => {
+    const items = result.findings.slice();
+    const copy = items.slice();
+    assert.equal(filterByStatus(items, {}, 'bogus').length, items.length);
+    assert.equal(filterByStatus(items, {}).length, items.length);
+    assert.equal(filterByStatus(null, {}, '수용').length, 0);
+    filterByStatus(items, setStatus({}, items[0], '수용'), '수용');
+    assert.deepEqual(items, copy);
+    assert.notEqual(filterByStatus(items, {}), items);
   });
 
   test('statuses survive a saved record and a backup round-trip', () => {
