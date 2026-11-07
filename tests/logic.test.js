@@ -123,6 +123,30 @@ const RISK_EXAMPLES = {
     pos: '영업지역을 보장하지 않으며 본부는 직영점을 낼 수 있다.',
     neg: '가맹점은 지정된 영업지역 안에서 영업할 권리를 갖는다.',
   },
+  'warranty-unlimited': {
+    pos: '하자보수 책임은 기간의 제한 없이 을이 부담한다.',
+    neg: '하자보수 기간은 납품일로부터 3개월로 한다.',
+  },
+  'set-off-unilateral': {
+    pos: '갑은 대금에서 손해배상금을 상계할 수 있다.',
+    neg: '대금은 상호 합의한 경우에만 상계한다.',
+  },
+  'subscription-trial-autocharge': {
+    pos: '무료 체험 기간이 끝나면 자동으로 유료 전환됩니다.',
+    neg: '무료 체험 기간은 14일이며 체험 후 이용 여부는 이용자가 정합니다.',
+  },
+  'franchise-price-fixing': {
+    pos: '가맹점은 본부가 지정한 판매 가격을 준수하여야 한다.',
+    neg: '가맹점은 판매 가격을 자율적으로 정한다.',
+  },
+  'labor-overtime-included': {
+    pos: '연장·야간 수당은 월 급여에 포함된 것으로 본다.',
+    neg: '연장근로수당은 시급에 따라 별도로 지급한다.',
+  },
+  'nda-scope-broad': {
+    pos: '갑이 공유한 모든 정보는 비밀로 본다.',
+    neg: '비밀정보는 서면으로 지정한 자료에 한정하며 공개된 정보는 제외한다.',
+  },
 };
 
 const NEUTRAL = '제1조 (목적)\n갑은 을에게 업무를 맡긴다.';
@@ -138,6 +162,7 @@ const ABSENT_EXAMPLES = {
   'absent-dispute-venue': { protect: '준거법은 대한민국 법으로 한다.' },
   'absent-franchise-disclosure': { protect: '가맹희망자는 정보공개서를 수령하였음을 확인한다.' },
   'absent-revision-limit': { protect: '무상 수정은 2회까지 제공한다.' },
+  'absent-return-materials': { protect: '비밀정보는 계약 종료 시 반환하거나 파기한다.' },
 };
 
 const ruleById = (id) => RULES.find((r) => r.id === id);
@@ -211,6 +236,40 @@ describe('absence rules (missing protections)', () => {
     const ids = analyzeContract(NEUTRAL, 'other').absences.map((a) => a.ruleId);
     assert.ok(ids.includes('absent-deposit-return-timing'));
     assert.ok(ids.includes('absent-advance-payment'));
+  });
+});
+
+describe('legal-reference flags (확인 필요)', () => {
+  const LEGAL_IDS = [
+    'payment-over-60', 'notice-period-long', 'probation-long', 'labor-at-will-dismissal',
+    'disguised-employment', 'deposit-deduction', 'rent-unilateral-increase', 'franchise-fee-no-refund',
+    'no-refund', 'subscription-cancel-restriction', 'subscription-trial-autocharge',
+    'franchise-price-fixing', 'labor-overtime-included', 'absent-franchise-disclosure',
+    'absent-deposit-return-timing',
+  ];
+
+  test('rules that cite a legal norm or threshold are flagged legalRef', () => {
+    for (const id of LEGAL_IDS) assert.equal(ruleById(id)?.legalRef, true, id);
+    const flagged = RULES.filter((r) => r.legalRef).map((r) => r.id).sort();
+    assert.deepEqual(flagged, [...LEGAL_IDS].sort());
+  });
+
+  test('legalRef and kind reach the analysis output', () => {
+    const r = analyzeContract('대금은 발행일로부터 90일 이내에 지급한다.', 'freelance');
+    const f = r.findings.find((x) => x.ruleId === 'payment-over-60');
+    assert.ok(f);
+    assert.equal(f.legalRef, true);
+    assert.equal(f.kind, 'risk');
+    const a = analyzeContract(NEUTRAL, 'lease').absences.find((x) => x.ruleId === 'absent-deposit-return-timing');
+    assert.equal(a.legalRef, true);
+    assert.equal(a.kind, 'absent');
+    const plain = analyzeContract('갑은 언제든지 본 계약을 해지할 수 있다.', 'other').findings[0];
+    assert.equal(plain.legalRef, false);
+  });
+
+  test('rule count matches the documented totals (위험 34, 누락 12)', () => {
+    assert.equal(RULES.filter((r) => r.kind === 'risk').length, 34);
+    assert.equal(RULES.filter((r) => r.kind === 'absent').length, 12);
   });
 });
 

@@ -11,6 +11,8 @@
 //  patterns      : (risk) 위험 문구 정규식 배열. 한국어·영어 패턴을 함께 둡니다.
 //  protects      : (absent) 보호 문구 정규식 배열. 하나라도 있으면 누락이 아님.
 //  guard         : (선택) (match, clauseText) => boolean. false 를 반환하면 무시.
+//  legalRef      : (선택) true 이면 법령·판례·관행 기준(예: 60일, 3개월, 정보공개서)을 참고한 항목입니다.
+//                  화면과 보고서에 '확인 필요' 표시를 붙이고, 법령 판정이 아니라는 점을 알립니다.
 //  why           : 왜 위험한지
 //  negotiation   : 협상 제안 문구 (협상 이메일 초안에 사용)
 //  question      : 계약 상대방에게 확인할 질문
@@ -46,6 +48,7 @@ export const RULES = [
   },
   {
     id: 'notice-period-long',
+    legalRef: true,
     title: '해지 통보 기간이 김',
     severity: '중간',
     kind: 'risk',
@@ -118,6 +121,7 @@ export const RULES = [
   },
   {
     id: 'payment-over-60',
+    legalRef: true,
     title: '대금 지급 기한이 60일 초과',
     severity: '높음',
     kind: 'risk',
@@ -294,6 +298,7 @@ export const RULES = [
   },
   {
     id: 'deposit-deduction',
+    legalRef: true,
     title: '보증금 공제·반환 거부 조건',
     severity: '높음',
     kind: 'risk',
@@ -321,6 +326,7 @@ export const RULES = [
   },
   {
     id: 'rent-unilateral-increase',
+    legalRef: true,
     title: '임대료 일방 인상',
     severity: '중간',
     kind: 'risk',
@@ -335,6 +341,7 @@ export const RULES = [
   },
   {
     id: 'probation-long',
+    legalRef: true,
     title: '수습·시용 기간이 김',
     severity: '중간',
     kind: 'risk',
@@ -352,6 +359,7 @@ export const RULES = [
   },
   {
     id: 'labor-at-will-dismissal',
+    legalRef: true,
     title: '사유 없이 해고·해지 가능',
     severity: '높음',
     kind: 'risk',
@@ -363,6 +371,7 @@ export const RULES = [
   },
   {
     id: 'disguised-employment',
+    legalRef: true,
     title: '근무 시간·지시 구속 (근로자성 쟁점)',
     severity: '중간',
     kind: 'risk',
@@ -377,6 +386,7 @@ export const RULES = [
   },
   {
     id: 'subscription-cancel-restriction',
+    legalRef: true,
     title: '해지 방법 제한',
     severity: '중간',
     kind: 'risk',
@@ -391,6 +401,7 @@ export const RULES = [
   },
   {
     id: 'no-refund',
+    legalRef: true,
     title: '환불·반환 불가',
     severity: '중간',
     kind: 'risk',
@@ -405,6 +416,7 @@ export const RULES = [
   },
   {
     id: 'franchise-fee-no-refund',
+    legalRef: true,
     title: '가맹금·보증금 반환 불가',
     severity: '높음',
     kind: 'risk',
@@ -424,6 +436,90 @@ export const RULES = [
     why: '영업지역을 보장하지 않으면 같은 상권에 본부가 직영점이나 다른 가맹점을 낼 수 있습니다.',
     negotiation: '가맹점의 영업지역(반경 또는 행정구역)을 명시하고, 그 안에서는 동일 브랜드의 추가 출점을 제한해 주시기를 제안드립니다.',
     question: '제 영업지역 안에 다른 가맹점이나 직영점이 생길 수 있나요?',
+  },
+
+  {
+    id: 'warranty-unlimited',
+    title: '하자보수 기간 무기한',
+    severity: '중간',
+    kind: 'risk',
+    types: ['freelance', 'other'],
+    patterns: [
+      /하자[^\n]{0,30}?(?:무기한|영구|기간의?\s?제한\s?없이|기간\s?없이)/g,
+      /(?:defect|warranty)[^\n]{0,30}?(?:indefinite|perpetual|without\s?limit)/gi,
+    ],
+    why: '하자보수 기간이 정해져 있지 않으면 납품이 끝난 뒤에도 무상 수리 의무가 오래 이어질 수 있습니다.',
+    negotiation: '하자보수 기간을 납품일(또는 검수일)로부터 명확한 기간(예: 3개월)으로 정하고, 그 이후의 유지보수는 별도 계약으로 하자는 것을 제안드립니다.',
+    question: '하자보수 책임은 언제까지 지나요? 기간이 지난 뒤의 수정은 어떻게 처리하나요?',
+  },
+  {
+    id: 'set-off-unilateral',
+    title: '대금·보증금 일방 상계',
+    severity: '중간',
+    kind: 'risk',
+    types: ['freelance', 'lease', 'other'],
+    patterns: [
+      /(?:대금|보수|정산금|보증금)[^\n]{0,30}?(?:상계|공제)[^\n]{0,15}?(?:할\s?수\s?있|한다|가능)/g,
+      /set[\s-]?off[^\n]{0,30}?(?:right|may|can)/gi,
+    ],
+    guard: (m, clause) => !/상호|쌍방|서면\s?합의|합의한\s?경우/.test(clause),
+    why: '상대방이 자기 손해배상금 등을 대금에서 일방적으로 빼면 약속한 금액보다 적게 받게 됩니다.',
+    negotiation: '상계는 상대방에게 확정된 채무가 있는 경우로 한정하고, 상계 전에 금액과 사유를 서면으로 통보하는 조건을 제안드립니다.',
+    question: '대금이나 보증금에서 다른 비용을 빼고 지급하는 경우가 있나요? 있다면 어떤 사유와 절차인가요?',
+  },
+  {
+    id: 'subscription-trial-autocharge',
+    title: '무료 체험 후 자동 결제·전환',
+    severity: '중간',
+    kind: 'risk',
+    types: ['subscription', 'other'],
+    legalRef: true,
+    patterns: [
+      /무료\s?(?:체험|이용|기간)[^\n]{0,40}?(?:자동|과금|청구)/g,
+      /free\s?trial[^\n]{0,40}?(?:automatic|charge|bill)/gi,
+    ],
+    why: '무료 기간이 끝난 뒤 본인이 모르는 사이 유료로 바뀌면 원치 않는 요금이 청구될 수 있습니다. 소비자 보호 규정과의 관계는 확인이 필요합니다.',
+    negotiation: '무료 체험이 끝나기 전에 사전 알림을 보내고, 유료 전환은 이용자가 명시적으로 동의한 경우에만 하도록 해 주시기를 제안드립니다.',
+    question: '무료 체험이 끝나면 자동으로 결제되나요? 종료 전에 알림을 받을 수 있나요?',
+  },
+  {
+    id: 'franchise-price-fixing',
+    title: '판매가격 지정·강제',
+    severity: '중간',
+    kind: 'risk',
+    types: ['franchise'],
+    legalRef: true,
+    patterns: [/(?:판매|소비자|공급)\s?가격[^\n]{0,20}?(?:지정|강제|준수하여야|따라야)/g],
+    why: '본부가 판매가를 정해 강제하면 가맹점의 가격 결정권이 제한됩니다. 허용 범위는 거래 방식과 관련 규정에 따라 달라 확인이 필요합니다.',
+    negotiation: '권장 소비자가격과 가맹점의 자율 결정 범위를 구분해 명시하고, 가격 준수 의무가 있다면 근거와 범위를 계약서에 적어 주시기를 제안드립니다.',
+    question: '판매가격은 본부가 정하나요, 아니면 권장 가격인가요? 가격을 따르지 않으면 어떤 불이익이 있나요?',
+  },
+  {
+    id: 'labor-overtime-included',
+    title: '연장·야간·휴일 수당 포함(포괄) 문구',
+    severity: '중간',
+    kind: 'risk',
+    types: ['labor'],
+    legalRef: true,
+    patterns: [/(?:연장|야간|휴일)[^\n]{0,12}?수당[^\n]{0,30}?(?:포함|포괄|지급하지\s?않)/g],
+    why: '수당을 월급에 포함했다고만 하면 실제 근로시간에 따른 수당이 계산되지 않을 수 있습니다. 포괄임금의 효력과 범위는 법령과 판례에 따라 달라 확인이 필요합니다.',
+    negotiation: '연장·야간·휴일 근로 시간을 명시하고, 수당 산정 방법과 월급에 포함된 시간 수를 계약서에 적어 주시기를 제안드립니다.',
+    question: '월급에 포함된 수당은 몇 시간분인가요? 실제 근무시간이 그보다 많으면 따로 지급하나요?',
+  },
+  {
+    id: 'nda-scope-broad',
+    title: '비밀정보 범위가 모든 정보',
+    severity: '중간',
+    kind: 'risk',
+    types: ['nda', 'freelance', 'franchise', 'other'],
+    patterns: [
+      /(?:모든|일체의|일체)\s?(?:정보|자료)[^\n]{0,20}?(?:비밀|기밀)/g,
+      /all\s(?:information|materials)[^\n]{0,30}?confidential/gi,
+    ],
+    guard: (m, clause) => !/공개된|공지된|예외/.test(clause),
+    why: '상대방이 준 모든 정보를 비밀로 보면, 이미 알려진 정보나 따로 가진 정보까지 지켜야 해 의무 범위가 불분명해집니다.',
+    negotiation: '비밀정보의 범위를 서면으로 표시한 정보로 한정하고, 이미 공개된 정보·독자 개발 정보·법령상 공개 의무가 있는 정보는 예외로 하는 것을 제안드립니다.',
+    question: '비밀정보는 어떻게 표시하거나 정하나요? 이미 공개된 정보도 비밀에 포함되나요?',
   },
 
   // ───────────── 누락 점검 (보호 조항이 없는지 확인) ─────────────
@@ -527,6 +623,7 @@ export const RULES = [
   },
   {
     id: 'absent-deposit-return-timing',
+    legalRef: true,
     title: '보증금 반환 기한 없음',
     severity: '높음',
     kind: 'absent',
@@ -552,6 +649,7 @@ export const RULES = [
   },
   {
     id: 'absent-franchise-disclosure',
+    legalRef: true,
     title: '정보공개서 제공 확인 없음',
     severity: '높음',
     kind: 'absent',
@@ -575,6 +673,17 @@ export const RULES = [
     why: '무상 수정 횟수가 정해져 있지 않으면 수정 요청이 끝없이 이어질 수 있습니다.',
     negotiation: '무상 수정 횟수(예: 2회)와 추가 수정 시 비용 기준을 계약서에 명시해 주시기를 제안드립니다.',
     question: '무상 수정은 몇 회까지 포함되어 있나요?',
+  },
+  {
+    id: 'absent-return-materials',
+    title: '자료 반환·파기 조항 없음',
+    severity: '중간',
+    kind: 'absent',
+    types: ['nda', 'freelance', 'other'],
+    protects: [/반환|파기|폐기|return|destroy/gi],
+    why: '계약이 끝난 뒤 받은 자료와 비밀정보를 어떻게 할지 정해 두지 않으면 보관과 사용 범위를 두고 다툼이 생길 수 있습니다.',
+    negotiation: '계약 종료 시 받은 자료를 반환하거나 파기하고, 그 확인을 서면으로 남기는 조항을 추가해 주시기를 제안드립니다.',
+    question: '계약이 끝나면 받은 자료와 정보는 어떻게 처리하나요?',
   },
 ];
 

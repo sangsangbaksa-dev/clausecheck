@@ -118,6 +118,8 @@ function publicRule(rule) {
     why: rule.why,
     negotiation: rule.negotiation,
     question: rule.question,
+    kind: rule.kind,
+    legalRef: !!rule.legalRef, // true 이면 '확인 필요' (임의 기준·기준일 표시 대상)
   };
 }
 
